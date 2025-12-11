@@ -37,17 +37,17 @@ print(latency_summary)
 # Plot 1: Average Latency
 plt.figure(figsize=(10, 6))
 sns.barplot(data=results_df, x='Workload', y='Packet Latency (s)', hue='Algorithm', errorbar=None)
-plt.title('Average Packet Latency (New Simulation)')
+plt.title('Average Packet Latency')
 plt.ylabel('Latency (s)')
-plt.savefig('new_avg_latency.png')
+plt.savefig('latest_avg_latency.png')
 
 # Plot 2: Buffer Occupancy Boxplot
 buffer_data = stats_df[stats_df['Metric'] == 'BUFFER']
 plt.figure(figsize=(10, 6))
-sns.boxplot(data=buffer_data, x='Algorithm', y='Value')
-plt.title('Buffer Occupancy Distribution (New Simulation)')
+sns.boxplot(data=buffer_data, x='Algorithm', y='Value', hue='Algorithm')
+plt.title('Buffer Occupancy Distribution')
 plt.ylabel('Packets in Buffer')
-plt.savefig('new_buffer_dist.png')
+plt.savefig('latest_buffer_dist.png')
 
 # Plot 3: Drops per Algorithm
 if 'DROP' in stats_df['Metric'].unique():
@@ -56,6 +56,6 @@ if 'DROP' in stats_df['Metric'].unique():
     plt.figure(figsize=(8, 5))
     sns.barplot(data=drop_counts, x='Algorithm', y='Drops', color='salmon')
     plt.title('Total Packet Drops by Algorithm')
-    plt.savefig('new_drop_counts.png')
+    plt.savefig('latest_drop_counts.png')
 
 print("Plots generated.")
