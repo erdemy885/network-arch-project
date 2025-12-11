@@ -7,6 +7,7 @@ import queue
 import csv
 import argparse
 import sys
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -27,18 +28,15 @@ LINK_SPEED_DELAY = 0.0005  # Transmission delay per packet
 
 @dataclass(order=True)
 class Packet:
-    # Priority field: Lower number = Higher Priority
-    # For pFabric: priority = remaining flow size
     priority: int
     id: int = field(compare=False)
     src: str = field(compare=False)
     dst: str = field(compare=False)
     flow_id: int = field(compare=False)
     size: int = field(compare=False)
-    type: str = field(compare=False, default="DATA")
-    timestamp: float = field(compare=False, default=0.0)
-    total_flow_size: int = field(compare=False, default=0)
-    scheduled_time: float = field(compare=False, default=0.0) # For Fastpass
+    total_flow_size: int = field(compare=False)
+    timestamp: float = field(compare=False)
+    type: str = field(default="DATA", compare=False)
 
 # ==========================================
 # 2. Traffic Generator
@@ -162,8 +160,26 @@ class Host(multiprocessing.Process):
             # Inter-flow wait
             time.sleep(self.traffic_gen.get_interarrival_time(self.load_factor))
 
+class Monitor(multiprocessing.Process):
+    def __init__(self, queue, filename):
+        super().__init__()
+        self.queue = queue
+        self.filename = filename
+
+    def run(self):
+        with open(self.filename, mode='a', newline='') as f:
+            writer = csv.writer(f)
+            while True:
+                try:
+                    record = self.queue.get()
+                    if record == "STOP": break
+                    writer.writerow(record)
+                    f.flush()
+                except:
+                    break
+
 class Switch(multiprocessing.Process):
-    def __init__(self, name, input_queue, routes, controller_queue, update_queue, algorithm):
+    def __init__(self, name, input_queue, routes, controller_queue, update_queue, algorithm, monitor_queue):
         super().__init__()
         self.name = name
         self.input_queue = input_queue
@@ -171,11 +187,13 @@ class Switch(multiprocessing.Process):
         self.controller_queue = controller_queue
         self.update_queue = update_queue
         self.algorithm = algorithm
+        self.monitor_queue = monitor_queue
         self.buffer = [] # Priority Queue (min-heap)
         self.hedera_map = {} 
         self.flow_bytes = {}
         # HEDERA specific
         self.hedera_threshold = 20000 # Bytes
+        self.packet_count = 0
 
     def run(self):
         while True:
@@ -186,10 +204,22 @@ class Switch(multiprocessing.Process):
                     self.hedera_map[fid] = port
 
             # 2. Ingress Processing (Buffer Management)
-            try:
-                # Non-blocking check to keep loop tight
-                pkt = self.input_queue.get(timeout=0.001)
+            fetched_any = False
+            # FIX: Fetch batch of packets to allow buffer to fill against the bottleneck
+            for _ in range(20):
+                try:
+                    # Non-blocking check
+                    pkt = self.input_queue.get_nowait()
+                    fetched_any = True
+                except queue.Empty:
+                    break
+
+                self.packet_count += 1
                 
+                # Log Buffer Occupancy periodically (every 20 packets)
+                if self.packet_count % 20 == 0:
+                    self.monitor_queue.put((time.time(), "BUFFER", self.name, len(self.buffer), self.algorithm.name))
+
                 # --- PFABRIC LOGIC: Priority Dropping ---
                 if self.algorithm == Algo.PFABRIC:
                     # If buffer is full
@@ -202,10 +232,12 @@ class Switch(multiprocessing.Process):
                         if pkt.priority < worst_packet.priority:
                             # Drop worst, accept new
                             self.buffer.remove(worst_packet)
+                            self.monitor_queue.put((time.time(), "DROP", self.name, 1, self.algorithm.name))
                             heapq.heapify(self.buffer) # Re-heapify is O(N) but N is small (30)
                             heapq.heappush(self.buffer, pkt)
                         else:
                             # Incoming packet is low priority, drop it (tail drop equivalent)
+                            self.monitor_queue.put((time.time(), "DROP", self.name, 1, self.algorithm.name))
                             pass 
                     else:
                         heapq.heappush(self.buffer, pkt)
@@ -214,10 +246,13 @@ class Switch(multiprocessing.Process):
                 else:
                     if len(self.buffer) < MAX_BUFFER_SIZE:
                         heapq.heappush(self.buffer, pkt)
-                    # else: Drop (implicit tail drop)
+                    else:
+                        # Drop (implicit tail drop)
+                        self.monitor_queue.put((time.time(), "DROP", self.name, 1, self.algorithm.name))
 
-            except queue.Empty:
-                pass
+            # Sleep briefly if idle to prevent CPU spin
+            if not fetched_any and not self.buffer:
+                time.sleep(0.0001)
 
             # 3. Egress Processing (Scheduling)
             if self.buffer:
@@ -268,6 +303,8 @@ class Switch(multiprocessing.Process):
 
                 # Send
                 try:
+                    # FIX: Simulate Transmission Delay (Bottleneck)
+                    time.sleep(LINK_SPEED_DELAY)
                     out_paths[out_idx].put(pkt)
                 except IndexError: pass
 
@@ -349,12 +386,15 @@ class GlobalController(multiprocessing.Process):
                     self.host_queues[src].put(("GRANT", response))
 
 class Receiver(multiprocessing.Process):
-    def __init__(self, input_queue, filename, algo_name, workload_name):
+    def __init__(self, input_queue, filename, algo_name, workload_name, monitor_queue):
         super().__init__()
         self.input_queue = input_queue
         self.filename = filename
         self.algo_name = algo_name
         self.workload_name = workload_name
+        self.monitor_queue = monitor_queue
+        self.total_bytes = 0
+        self.start_time = time.time()
 
     def run(self):
         with open(self.filename, mode='a', newline='') as f:
@@ -362,12 +402,17 @@ class Receiver(multiprocessing.Process):
             while True:
                 try:
                     pkt = self.input_queue.get(timeout=5)
+                    self.total_bytes += pkt.size
                     # FCT calculation
                     fct = time.time() - pkt.timestamp
                     writer.writerow([self.algo_name, self.workload_name, pkt.flow_id, pkt.total_flow_size, fct])
                     f.flush()
                 except queue.Empty:
                     # Timeout suggests simulation end
+                    duration = time.time() - self.start_time
+                    if duration > 0:
+                        throughput_mbps = (self.total_bytes * 8) / (duration * 1_000_000)
+                        self.monitor_queue.put((time.time(), "THROUGHPUT", "Receiver", throughput_mbps, self.algo_name))
                     break
 
 # ==========================================
@@ -387,7 +432,7 @@ def merger(q_in1, q_in2, q_out):
         except queue.Empty: pass
         time.sleep(0.0001)
 
-def build_topology(algorithm, workload_type, output_file):
+def build_topology(algorithm, workload_type, output_file, stats_file):
     # Link Queues
     h0_sw1 = multiprocessing.Queue()
     h1_sw1 = multiprocessing.Queue()
@@ -402,6 +447,10 @@ def build_topology(algorithm, workload_type, output_file):
     # Host Reply Queues (For Fastpass Grants)
     h0_reply_q = multiprocessing.Queue()
     h1_reply_q = multiprocessing.Queue()
+
+    # Monitor Queue
+    monitor_q = multiprocessing.Queue()
+    monitor = Monitor(monitor_q, stats_file)
 
     # Routing Tables
     # Receiver is reachable via two paths from Switch 1
@@ -419,22 +468,22 @@ def build_topology(algorithm, workload_type, output_file):
     # We use a merger helper to simulate simultaneous arrival at switch port buffers
     sw1_input_merger = multiprocessing.Process(target=merger, args=(h0_sw1, h1_sw1, shared_uplink))
     
-    sw1 = Switch("Switch1", shared_uplink, sw1_routes, ctrl_req, sw1_update, algorithm)
+    sw1 = Switch("Switch1", shared_uplink, sw1_routes, ctrl_req, sw1_update, algorithm, monitor_q)
     
     # Switch 2 (Core/Egress Switch)
     # Merges the two paths back into one uplink to receiver
     sw1_sw2_merged = multiprocessing.Queue()
     sw2_input_merger = multiprocessing.Process(target=merger, args=(sw1_sw2_path1, sw1_sw2_path2, sw1_sw2_merged))
-    sw2 = Switch("Switch2", sw1_sw2_merged, sw2_routes, ctrl_req, multiprocessing.Queue(), algorithm)
+    sw2 = Switch("Switch2", sw1_sw2_merged, sw2_routes, ctrl_req, multiprocessing.Queue(), algorithm, monitor_q)
     
-    recv = Receiver(sw2_recv, output_file, algorithm.value, workload_type)
+    recv = Receiver(sw2_recv, output_file, algorithm.value, workload_type, monitor_q)
 
     # Hosts
     destinations = ["Receiver"]
     h0 = Host("Host_A", destinations, h0_sw1, ctrl_req, h0_reply_q, algorithm, workload_type)
     h1 = Host("Host_B", destinations, h1_sw1, ctrl_req, h1_reply_q, algorithm, workload_type)
 
-    return [ctl, sw1_input_merger, sw1, sw2_input_merger, sw2, recv, h0, h1]
+    return [monitor, ctl, sw1_input_merger, sw1, sw2_input_merger, sw2, recv, h0, h1]
 
 # ==========================================
 # 5. Main Entry Point
@@ -445,7 +494,12 @@ if __name__ == "__main__":
     parser.add_argument("--algo", type=str, required=True, help="ECMP, HEDERA, FASTPASS, PFABRIC")
     parser.add_argument("--workload", type=str, required=True, help="MIXED, SMALL_DOMINATED, LARGE_DOMINATED")
     parser.add_argument("--out", type=str, required=True, help="CSV output filename")
+    parser.add_argument("--stats", type=str, required=False, default="stats.csv", help="Stats output filename")
+    parser.add_argument("--seed", type=int, required=False, default=None, help="Random seed")
     args = parser.parse_args()
+
+    if args.seed is not None:
+        random.seed(args.seed)
 
     try:
         algo_enum = Algo[args.algo.upper()]
@@ -454,13 +508,19 @@ if __name__ == "__main__":
         sys.exit(1)
     
     try:
-        with open(args.out, 'x', newline='') as f:
+        with open(args.out, 'a', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(["Algorithm", "Workload", "FlowID", "Size", "FCT"])
-    except FileExistsError:
-        pass
+            if f.tell() == 0:
+                writer.writerow(["Algorithm", "Workload", "FlowID", "Size", "FCT"])
+    except Exception: pass
 
-    processes = build_topology(algo_enum, args.workload, args.out)
+    # Initialize stats file
+    if not os.path.exists(args.stats):
+        with open(args.stats, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(["Timestamp", "Metric", "Entity", "Value", "Algorithm"])
+
+    processes = build_topology(algo_enum, args.workload, args.out, args.stats)
     
     for p in processes: p.start()
 

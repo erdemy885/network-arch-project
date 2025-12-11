@@ -1,3 +1,4 @@
+
 import subprocess
 import os
 import pandas as pd
@@ -9,6 +10,7 @@ ALGORITHMS = ["ECMP", "HEDERA", "PFABRIC", "FASTPASS"]
 # Using just MIXED and SMALL_DOMINATED for clearer demonstration of pFabric logic
 WORKLOADS = ["MIXED", "SMALL_DOMINATED", "LARGE_DOMINATED"]
 OUTPUT_FILE = "experiment_results.csv"
+STATS_FILE = "experiment_stats.csv"
 
 def run_simulation():
     """
@@ -17,9 +19,11 @@ def run_simulation():
     # Remove old results
     if os.path.exists(OUTPUT_FILE):
         os.remove(OUTPUT_FILE)
+    if os.path.exists(STATS_FILE):
+        os.remove(STATS_FILE)
     
     print(f"--- Starting Experiments ---")
-    print(f"Results will be saved to {OUTPUT_FILE}")
+    print(f"Results will be saved to {OUTPUT_FILE} and {STATS_FILE}")
 
     for algo in ALGORITHMS:
         for load in WORKLOADS:
@@ -30,7 +34,9 @@ def run_simulation():
                 "python", "network_simulation.py",
                 "--algo", algo,
                 "--workload", load,
-                "--out", OUTPUT_FILE
+                "--out", OUTPUT_FILE,
+                "--stats", STATS_FILE,
+                "--seed", "42" # Use fixed seed for reproducibility
             ]
             
             subprocess.run(cmd)
@@ -43,6 +49,8 @@ def plot_results():
     Reads the CSV and generates:
     1. Average FCT Bar Chart
     2. CDF (Cumulative Distribution Function) for Tail Latency
+    3. Packet Loss Bar Chart
+    4. Buffer Occupancy Box Plot
     """
     if not os.path.exists(OUTPUT_FILE):
         print("No data file found!")
@@ -67,7 +75,7 @@ def plot_results():
     plt.tight_layout()
     plt.savefig("plot_average_fct.png")
     print("Saved plot_average_fct.png")
-    plt.show()
+    # plt.show()
 
     # --- Plot 2: CDF of Tail Latency (For Mixed Workload) ---
     # We focus on Mixed workload to see how pFabric handles small flows amidst large ones.
@@ -94,7 +102,50 @@ def plot_results():
     plt.tight_layout()
     plt.savefig("plot_cdf_latency.png")
     print("Saved plot_cdf_latency.png")
-    plt.show()
+    # plt.show()
+
+    # --- Plot 3: Packet Loss ---
+    if os.path.exists(STATS_FILE):
+        stats_df = pd.read_csv(STATS_FILE)
+        
+        # Filter for DROP events
+        drops = stats_df[stats_df['Metric'] == 'DROP']
+        
+        if not drops.empty:
+            plt.figure(figsize=(10, 6))
+            # Count drops per Algorithm
+            drop_counts = drops.groupby('Algorithm')['Value'].count()
+            drop_counts.plot(kind='bar', color='salmon', alpha=0.8)
+            plt.title("Total Packet Loss per Algorithm")
+            plt.ylabel("Packets Dropped")
+            plt.xticks(rotation=0)
+            plt.grid(axis='y', linestyle='--', alpha=0.7)
+            plt.tight_layout()
+            plt.savefig("plot_packet_loss.png")
+            print("Saved plot_packet_loss.png")
+        
+        # --- Plot 4: Buffer Occupancy (Boxplot) ---
+        buffers = stats_df[stats_df['Metric'] == 'BUFFER']
+        if not buffers.empty:
+            plt.figure(figsize=(10, 6))
+            # We want to see distribution of buffer depth
+            # Create a list of arrays for boxplot
+            data_to_plot = []
+            labels = []
+            for algo in ALGORITHMS:
+                algo_buf = buffers[buffers['Algorithm'] == algo]['Value']
+                if len(algo_buf) > 0:
+                    data_to_plot.append(algo_buf)
+                    labels.append(algo)
+            
+            if data_to_plot:
+                plt.boxplot(data_to_plot, labels=labels)
+                plt.title("Switch Buffer Occupancy Distribution")
+                plt.ylabel("Packets in Buffer")
+                plt.grid(axis='y', linestyle='--', alpha=0.7)
+                plt.tight_layout()
+                plt.savefig("plot_buffer_occupancy.png")
+                print("Saved plot_buffer_occupancy.png")
 
 if __name__ == "__main__":
     # 1. Run the simulations
